@@ -1,0 +1,3 @@
+﻿wandb
+easydict
+--no-deps torchaudio==0.9.0
