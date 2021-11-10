@@ -4,17 +4,19 @@ from tqdm import tqdm
 import torch
 import torchaudio
 
+
 class DatasetDownloader():
 
     def __init__(self, key_word='sheila'):
         self.key_word = key_word
         self.datadir = "speech_commands"
-        
+
         if os.path.isfile('speech_commands_v0.01.tar.gz'):
             print('Data is already downloaded.')
         else:
             print('Downloading data...')
-            os.system('wget http://download.tensorflow.org/data/speech_commands_v0.01.tar.gz -O speech_commands_v0.01.tar.gz')
+            os.system(
+                'wget http://download.tensorflow.org/data/speech_commands_v0.01.tar.gz -O speech_commands_v0.01.tar.gz')
             os.system('mkdir speech_commands && tar -C speech_commands -xvzf speech_commands_v0.01.tar.gz 1> log')
             print("Ready!")
 
@@ -23,15 +25,13 @@ class DatasetDownloader():
             for cls in os.listdir(self.datadir)
             if os.path.isdir(os.path.join(self.datadir, cls))
         }
-        
+
         print('Classes:', ', '.join(sorted(self.samples_by_target.keys())[1:]))
-
-
 
     def generate_labeled_data(self):
         if os.path.isfile('labeled_data.csv'):
             print('Data is already labeled')
-            labeled_databels = pd.read_csv('labeled_data.csv')
+            labeled_data = pd.read_csv('labeled_data.csv')
             background_noises = pd.read_csv('background_noises.csv')
             return labeled_data, background_noises
 
@@ -49,12 +49,12 @@ class DatasetDownloader():
                     else:
                         label = 0
                     labeled_data = labeled_data.append({'name': name, 'word': word, 'label': label}, ignore_index=True)
-            
+
             elif el == '_background_noise_':
                 for name in self.samples_by_target[el]:
                     if 'README' not in name:
                         background_noises = background_noises.append(
-                            {'name':name}, ignore_index=True
+                            {'name': name}, ignore_index=True
                         )
 
         labeled_data.to_csv('labeled_data.csv', index=False)
@@ -62,7 +62,7 @@ class DatasetDownloader():
 
         return labeled_data, background_noises
 
-        
+
 class TrainDataset(torch.utils.data.Dataset):
 
     def __init__(self, root='', df=None, kw=None, transform=None):
@@ -77,21 +77,18 @@ class TrainDataset(torch.utils.data.Dataset):
         self.kw = kw
         self.df = df
         self.transform = transform
-        
 
     def __len__(self):
         return self.df.shape[0]
-    
 
     def __getitem__(self, idx):
         utt_name = self.root + self.df.loc[idx, 'name']
         utt = torchaudio.load(utt_name)[0].squeeze()
         word = self.df.loc[idx, 'word']
         label = self.df.loc[idx, 'label']
-        
+
         if self.transform:
             utt = self.transform(utt)
 
         sample = {'utt': utt, 'word': word, 'label': label}
         return sample
-
