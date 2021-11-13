@@ -1,5 +1,11 @@
 # Homework 2 (KWS)
 
+### Progress
+
+    1) Train main model: [report](https://wandb.ai/iamilyasedunov/train/reports/Key-Word-Spotting--VmlldzoxMjEyMTE0)
+
+_______
+
 ### Task
 Implement streaming KWS, speed up and compress the model 10 times.
 

@@ -6,7 +6,7 @@ from tqdm import tqdm
 from easydict import EasyDict as edict
 
 # import wandb
-
+import os
 import torch
 from torch.utils.data import DataLoader
 from torch import distributions
@@ -24,6 +24,35 @@ from torch.cuda.amp import autocast
 
 
 # Helper functions
+
+
+class Collator:
+    def __call__(self, data):
+        wavs = []
+        labels = []
+
+        for el in data:
+            wavs.append(el['utt'])
+            labels.append(el['label'])
+
+        # torch.nn.utils.rnn.pad_sequence takes list(Tensors) and returns padded (with 0.0) Tensor
+        wavs = pad_sequence(wavs, batch_first=True)
+        labels = torch.Tensor(labels).long()
+        return wavs, labels
+
+
+def save_torchscript_model(model, model_dir, model_filename):
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+    model_filepath = os.path.join(model_dir, model_filename)
+    torch.jit.save(torch.jit.script(model), model_filepath)
+
+
+def load_torchscript_model(model_filepath, device):
+    model = torch.jit.load(model_filepath, map_location=device)
+
+    return model
+
 
 def set_seed(seed):
     torch.backends.cudnn.deterministic = True
@@ -52,7 +81,7 @@ def get_sampler(target):
     samples_weight = np.array([weight[t] for t in target])
 
     samples_weight = torch.from_numpy(samples_weight)
-    samples_weigth = samples_weight.double()
+    samples_weight = samples_weight.double()
     sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
     return sampler
 
@@ -99,3 +128,9 @@ def get_au_fa_fr(probs, labels):
 
     # ~ area under curve using trapezoidal rule
     return -np.trapz(FRs, x=FAs)
+
+
+def get_size_in_megabytes(model):
+    num_params = sum([p.numel() for p in model.parameters() if p.requires_grad])
+    param_size = next(model.parameters()).element_size()
+    return num_params, (num_params * param_size) / (2 ** 20)
