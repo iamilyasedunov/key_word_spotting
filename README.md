@@ -19,6 +19,9 @@
     **MACs reduction times**: 7,086758545
 
     **Model size reduction (times):** 12,73771711
+
+### [Report](https://aback-fossa-940.notion.site/DLA-report-HW2-07e8147befc6413598726c764307dd13)
+
 _______
 
 ### Task
