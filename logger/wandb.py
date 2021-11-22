@@ -17,7 +17,8 @@ class WanDBWriter:
 
             wandb.init(
                 project=config['name'],
-                config=config
+                config=config,
+                entity='iamilyasedunov'
             )
             self.wandb = wandb
 

@@ -1,11 +1,10 @@
-from dataset_utils import DatasetDownloader, TrainDataset
+from dataset_utils import DatasetDownloader, TrainDataset, SpeechCommandDataset
 from sklearn.model_selection import train_test_split
 from augmentations.augs_creation import AugsCreation
 from preprocessing.log_mel_spec import LogMelspec
-from model.model import *
 from train_utils.utils import *
 from logger import *
-
+import copy
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -14,27 +13,33 @@ set_seed(21)
 
 
 def main(config):
+    if config.qat:
+        from model.qat_model import CRNN
+    else:
+        from model.model_fixed import CRNN
+
     writer = get_writer(config)
-    dataset_downloader = DatasetDownloader(key_word)
-    labeled_data, _ = dataset_downloader.generate_labeled_data()
-    # create 2 dataframes for train/val so we can use augmentations only for train
-    indexes = torch.randperm(len(labeled_data))
-    train_indexes = indexes[:int(len(labeled_data) * 0.8)]
-    val_indexes = indexes[int(len(labeled_data) * 0.8):]
 
-    train_df = labeled_data.iloc[train_indexes].reset_index(drop=True)
-    val_df = labeled_data.iloc[val_indexes].reset_index(drop=True)
+    dataset = SpeechCommandDataset(
+        path2dir='speech_commands', keywords=config.keyword
+    )
+    data_len_scaled = int(len(dataset) * config.data_percent) if config.data_percent else len(dataset)
+    print(data_len_scaled)
+    indexes = torch.randperm(data_len_scaled)
+    train_indexes = indexes[:int(data_len_scaled * 0.8)]
+    val_indexes = indexes[int(data_len_scaled * 0.8):]
 
-    # Sample is a dict of utt, word and label
-    transform_tr = AugsCreation()
-    train_set = TrainDataset(df=train_df, kw=config.key_word, transform=transform_tr)
-    val_set = TrainDataset(df=val_df, kw=config.key_word)
+    train_df = dataset.csv.iloc[train_indexes].reset_index(drop=True)
+    val_df = dataset.csv.iloc[val_indexes].reset_index(drop=True)
+
+    train_set = SpeechCommandDataset(csv=train_df, transform=AugsCreation())
+    val_set = SpeechCommandDataset(csv=val_df)
 
     print(f"all train({len(train_set)}) + val samples({len(val_set)}) = {len(train_set) + len(val_set)}")
-
+    student_model = None
     # sampler for oversampling
-    train_sampler = get_sampler(train_set.df['label'].values)
-    val_sampler = get_sampler(val_set.df['label'].values)
+    train_sampler = get_sampler(train_set.csv['label'].values)
+    #val_sampler = get_sampler(val_set.csv['label'].values)
 
     # Dataloaders
     # Here we are obliged to use shuffle=False because of our sampler with randomness inside.
@@ -46,45 +51,102 @@ def main(config):
 
     val_loader = DataLoader(val_set, batch_size=config.batch_size,
                             shuffle=False, collate_fn=Collator(),
-                            sampler=val_sampler,
                             num_workers=2, pin_memory=False)
+
+    val_check = DataLoader(val_set, batch_size=1,
+                           shuffle=False, collate_fn=Collator(),
+                           num_workers=2, pin_memory=False)
 
     melspec_train = LogMelspec(is_train=True, config=config)
     melspec_val = LogMelspec(is_train=False, config=config)
 
     # init model
-    CRNN_model = CRNN(config)
-    attn_layer = AttnMech(config)
-    full_model = FullModel(config, CRNN_model, attn_layer)
-    full_model = full_model.to(config.device)
-    num_params, size_in_mb = get_size_in_megabytes(full_model)
-    print(full_model)
-    print(f"Num params: {num_params}, {count_parameters(full_model)}")
-    print(f"Model size in mb: {round(size_in_mb, 3)}")
-    opt = torch.optim.Adam(full_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    model = CRNN(config)
+    model = model.to(config.device)
 
+    if config.resume:
+        checkpoint = torch.load(config.resume)
+        state_dict = checkpoint["state_dict"]
+        model.load_state_dict(state_dict, strict=False)
+        print(f"Model loaded from checkpoint: {config.resume}")
+    print(model)
+    get_model_info(model, val_check, melspec_val, config.device)
+
+    if config.qat:
+        backend = "fbgemm"
+        torch.backends.quantized.engine = backend
+        qat_model = copy.deepcopy(model)
+        # qat_model.fuse_model()
+        qat_model.train()
+        qat_model.qconfig = torch.quantization.get_default_qat_qconfig(backend)
+        model.gru.qconfig = None
+        model.attention.qconfig = None
+        qat_model_fused = torch.quantization.fuse_modules(qat_model.conv, [['0', '1']])
+        qat_model_fused = torch.quantization.fuse_modules(qat_model_fused.attention.energy, [['0', '2']])
+        qat_model_fused = torch.quantization.fuse_modules(qat_model_fused, [['classifier']])
+
+        qat_model_prepared = torch.quantization.prepare_qat(qat_model_fused, inplace=True)
+        model = copy.deepcopy(qat_model_prepared)
+
+    if config.structured_pruning_dynamic_quant:
+        # layer_type, proportion = nn.Conv2d, 0.5
+        # prune_model(model=model, pruning_fn="random_structured", amount=0.8, dim=0, l_norm=1)
+        pruned_model = copy.deepcopy(model)
+        pruned_model.gru = prune.ln_structured(model.gru, 'weight_ih_l0', 0.5, n=1, dim=1)
+        pruned_model.gru = prune.remove(pruned_model.gru, 'weight_ih_l0')
+        get_model_info(pruned_model, val_check, melspec_val, config.device)
+
+    if config.distillation_soft_labels.mimic_logits or config.distillation_soft_labels.soft_labels:
+        student_model = CRNN(config.distillation_soft_labels.student_config)
+        student_model = student_model.to(config.device)
+        if config.distillation_soft_labels.resume:
+            checkpoint = torch.load(config.distillation_soft_labels.resume)
+            state_dict = checkpoint["state_dict"]
+            student_model.load_state_dict(state_dict, strict=False)
+            print(f"Model STUDENT loaded from checkpoint: {config.distillation_soft_labels.resume}")
+        print("STUDENT model:")
+        get_model_info(student_model, val_check, melspec_val, config.device)
+        opt = torch.optim.Adam(student_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     trainer = Trainer(writer, config)
-
+    min_val_metric = 100
     for n in range(config.num_epochs):
         config_writer = {
             "epoch": n + 1,
             "type": "train",
             "profile_model": False,
         }
-        trainer.train_epoch(full_model, opt, train_loader, melspec_train,
-                            config.gru_num_layers, config.gru_num_dirs,
-                            config.hidden_size, config.device, config_writer)
+        if config.distillation_soft_labels and config.distillation_soft_labels.mimic_logits:
+            config_writer["lambda"] = config.distillation_soft_labels.student_config.lambda_
+            trainer.train_kd_mimic_logits(model, student_model, opt, train_loader, melspec_train, config.device,
+                                          config_writer)
+            trainer.validation(student_model, val_loader, melspec_val, config.device, config_writer)
 
-        trainer.validation(full_model, val_loader, melspec_val,
-                           config.gru_num_layers, config.gru_num_dirs,
-                           config.hidden_size, config.device, config_writer)
+        elif config.distillation_soft_labels and config.distillation_soft_labels.soft_labels:
+            config_writer["T"] = config.distillation_soft_labels.student_config.T
+            config_writer["lambda"] = config.distillation_soft_labels.student_config.lambda_
+            trainer.train_kd_soft_labels(model, student_model, opt, train_loader, melspec_train, config.device,
+                                         config_writer)
+            trainer.validation(student_model, val_loader, melspec_val, config.device, config_writer)
+        else:
+            trainer.train_epoch(model, opt, train_loader, melspec_train, config.device, config_writer)
 
+            trainer.validation(model, val_loader, melspec_val, config.device, config_writer)
+        val_metric = trainer.get_mean_val_au_fa_fr()
         # print('END OF EPOCH', n)
-        if n % 10 == 0:
-            model_path = config["save_dir"] + "/" + f"model_acc_{round(trainer.get_mean_val_acc(), 2)}_epoch_{n}.pth"
+
+        if n % 10 == 0 or val_metric < min_val_metric:
+            min_val_metric = val_metric if val_metric < min_val_metric else min_val_metric
+            model_path = config["save_dir"] + "/" + f"model_acc_{round(val_metric, 5)}_epoch_{n}.pth"
+
+            if config.distillation_soft_labels and student_model is not None:
+                state_dict = student_model.state_dict()
+            else:
+                state_dict = model.state_dict()
             state = {
                 "epoch": n,
-                "state_dict": full_model.state_dict(),
+                "state_dict": state_dict,
                 "optimizer": opt.state_dict(),
                 "config": config,
             }
@@ -96,28 +158,53 @@ if __name__ == "__main__":
     key_word = 'sheila'  # We will use 1 key word -- 'sheila'
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     config = {
+        'data_percent': 1,
         'verbosity': 2,
-        'name': "train",
-        'log_step': 50,
-        'exper_name': f"kws_{key_word}",
-        'key_word': key_word,
-        'batch_size': 256,
-        'len_epoch': 200,
-        'learning_rate': 3e-4,
+        'name': "train_upd_crnn",
+        'log_step': 10,
+        'exper_name': f"kws_{key_word}_crnn_unidirect_teacher",
+        'keyword': key_word,
+        'batch_size': 128,
+        'len_epoch': 1000,
+        'learning_rate': 2e-4,
         'weight_decay': 1e-5,
-        'num_epochs': 100,
+        'num_epochs': 300,
         'bidirectional': False,
+        'resume': "saved/models/kws_sheila_crnn_unidirect_teacher/1118_190401/model_acc_2e-05_epoch_42.pth",
+        'cnn_out_channels': 8,
         'n_mels': 40,  # number of mels for melspectrogram
-        'kernel_size': (20, 5),  # size of kernel for convolution layer in CRNN
-        'stride': (8, 2),  # size of stride for convolution layer in CRNN
-        'hidden_size': 128,  # size of hidden representation in GRU
+        'kernel_size': (5, 20),  # size of kernel for convolution layer in CRNN
+        'stride': (2, 8),  # size of stride for convolution layer in CRNN
+        'hidden_size': 64,  # size of hidden representation in GRU
         'gru_num_layers': 2,  # number of GRU layers in CRNN
         'gru_num_dirs': 2,  # number of directions in GRU (2 if bidirectional)
         'num_classes': 2,  # number of classes (2 for "no word" or "sheila is in audio")
+        'dropout': 0.1,
         'sample_rate': 16000,
-        'device': device.__str__()
+        'device': device.__str__(),
+        'qat': False,
+        'structured_pruning_dynamic_quant': False,
+        'distillation_soft_labels': {
+            'mimic_logits': True,
+            'soft_labels': False,
+            'resume': False, #"saved/models/kws_sheila_crnn_unidirect_teacher/1118_232130/model_acc_5e-05_epoch_282.pth",
+            "student_config": {
+                'T': 15.0,
+                'lambda_': 0.95,
+                'cnn_out_channels': 4,
+                'kernel_size': (5, 20),
+                'stride': (2, 8),
+                'n_mels': 40,
+                'hidden_size': 16,
+                'gru_num_layers': 1,
+                'bidirectional': False,
+                'num_classes': 2,
+                'dropout': 0.0,
+           }
+
+        }
     }
 
     config = make_config(key_word, config)
-    print(f"keyword: '{config.key_word}'\ndevice: {config.device}")
+    print(f"keyword: '{config.keyword}'\ndevice: {config.device}")
     main(config)
