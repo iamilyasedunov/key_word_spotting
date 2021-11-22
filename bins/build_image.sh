@@ -1,5 +1,5 @@
 #!/bin/bash
 
-image_name="kws_template"
+image_name="kws_report"
 
 docker build -t "$image_name":latest ..
