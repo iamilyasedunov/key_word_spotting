@@ -1,115 +1,76 @@
-import sys
 from utils.utils import *
-from thop import profile
-from ptflops import get_model_complexity_info
 from torch.quantization import QuantStub, DeQuantStub
 
-sys.path.append(sys.path[0] + "/..")
 
+class Attention(nn.Module):
 
-# Pay attention to _groups_ param
+    def __init__(self, hidden_size: int):
+        super().__init__()
 
-def SepConv(in_size, out_size, kernel_size, stride, padding=0):
-    return nn.Sequential(
-        torch.nn.Conv1d(in_size, in_size, kernel_size[1],
-                        stride=stride[1], groups=in_size,
-                        padding=padding),
+        self.energy = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
 
-        torch.nn.Conv1d(in_size, out_size, kernel_size=1,
-                        stride=stride[0], groups=int(in_size / kernel_size[0]))
-    )
+    def forward(self, input):
+        energy = self.energy(input)
+        alpha = torch.softmax(energy, dim=-2)
+        return (input * alpha).sum(dim=-2)
 
 
 class CRNN(nn.Module):
-    def __init__(self, config):
-        super(CRNN, self).__init__()
-        self.quant = QuantStub()
-        self.dequant = DeQuantStub()
-        self.sepconv = SepConv(in_size=config.n_mels, out_size=config.hidden_size,
-                               kernel_size=config.kernel_size, stride=config.stride)
-
-        self.gru = torch.nn.GRU(input_size=config.hidden_size, hidden_size=config.hidden_size,
-                                num_layers=config.gru_num_layers,
-                                dropout=0.1,
-                                bidirectional=config.bidirectional)
-
-    def forward(self, x, hidden):
-        x = self.sepconv(x)
-        # (BS, hidden, seq_len) ->(seq_len, BS, hidden)
-        x = x.permute(2, 0, 1)
-        x, hidden = self.gru(x, hidden)
-        # x : (seq_len, BS, hidden * num_dirs)
-        # hidden : (num_layers * num_dirs, BS, hidden)
-        return x, hidden
-
-
-class AttnMech(nn.Module):
 
     def __init__(self, config):
-        super(AttnMech, self).__init__()
+        super().__init__()
+        self.config = config
 
-        ratio = 2 if config.bidirectional else 1
-        lin_size = config.hidden_size * ratio
+        self.conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels=1, out_channels=config.cnn_out_channels,
+                kernel_size=config.kernel_size, stride=config.stride
+            ),
+            nn.Flatten(start_dim=1, end_dim=2),
+        )
+
+        self.conv_out_frequency = (config.n_mels - config.kernel_size[0]) // \
+                                  config.stride[0] + 1
+
+        self.gru = nn.GRU(
+            input_size=self.conv_out_frequency * config.cnn_out_channels,
+            hidden_size=config.hidden_size,
+            num_layers=config.gru_num_layers,
+            dropout=config.dropout,
+            bidirectional=config.bidirectional,
+            batch_first=True
+        )
+        hidden_size = config.hidden_size * 2 if config.bidirectional else config.hidden_size
+        self.attention = Attention(hidden_size)
+        self.classifier = nn.Linear(hidden_size, config.num_classes)
         self.quant = QuantStub()
         self.dequant = DeQuantStub()
-        self.Wx_b = nn.Linear(lin_size, lin_size)
-        self.Vt = nn.Linear(lin_size, 1, bias=False)
-        self.softmax = torch.nn.Softmax(dim=-1)
 
-    def forward(self, inputs, data=None):
-        # count only 1 e_t
+    def forward(self, input_):
+        input_ = self.quant(input_)
+        input_ = input_.unsqueeze(dim=1)
+        conv_output = self.conv(input_).transpose(-1, -2)
+        conv_output = self.dequant(conv_output)
 
-        if data is None:
-            x = inputs
-            x = torch.tanh(self.Wx_b(x))
-            e = self.Vt(x)
-            return e
-        # recount attention for full vector e
-        e = inputs
-        # (BS, seq_len, hid_size*num_dirs)
-        data = data.transpose(0, 1)
-        alphas = self.softmax(e).unsqueeze(1)
-        c = torch.matmul(alphas, data).squeeze()  # attetntion_vector
-        return c
+        gru_output, _ = self.gru(conv_output)
+        context_vector = self.attention(gru_output)
 
-
-class FullModel(nn.Module):
-
-    def __init__(self, config, CRNN_model, attn_layer):
-        super(FullModel, self).__init__()
-        self.quant = QuantStub()
-        self.dequant = DeQuantStub()
-        self.CRNN_model = CRNN_model
-        self.attn_layer = attn_layer
-
-        # ll_in_size, ll_out_size = HIDDEN_SIZE * GRU_NUM_DIRS, NUM_CLASSES
-        # last layer
-        ratio = 2 if config.bidirectional else 1
-        self.U = nn.Linear(config.hidden_size * ratio,
-                           config.num_classes, bias=False)
-
-    def forward(self, batch, hidden=None):
-        output, hidden = self.CRNN_model(batch, hidden)
-        # output : (seq_len, BS, hidden * num_dirs)
-        # hidden : (num_layers * num_dirs, BS, hidden)
-
-        e = []
-        output = self.quant(output)
-        for seq_el in output:
-            e_t = self.attn_layer(seq_el)  # (BS, 1)
-            e.append(e_t)
-        e = torch.nn.quantized.FloatFunctional().cat(e, dim=1)  # (BS, seq_len)
-        e = self.dequant(e)
+        context_vector = self.quant(context_vector)
+        output = self.classifier(context_vector)
         output = self.dequant(output)
-        c = self.attn_layer(e, output)  # attention_vector
-        Uc = self.U(c)
-        return Uc  # we will need to get probs, so we use return logits
+        return output
 
-    # def fuse_model(self):
-    #    for m in self.modules():
-    #        if type(m) == CRNN:
-    #            torch.quantization.fuse_modules(m.sepconv, [['0', '1']],)
-    #        if type(m) == AttnMech:
-    #            torch.quantization.fuse_modules(m.attn_layer, ['Wx_b', 'Vt'], inplace=True)
-    #       if type(m) == nn.Linear:
-    #            torch.quantization.fuse_modules(m.attn_layer, ['Wx_b', 'Vt'], inplace=True)
+    def fuse_model(self):
+        for m in self.modules():
+            #if type(m) == nn.Sequential:
+            #    print(m)
+            #    torch.quantization.fuse_modules(m, ['0', '1'], inplace=False)
+            #if type(m) == Attention:
+            #    torch.quantization.fuse_modules(m.energy, ['0', '1', '2'], inplace=True)
+            if type(m) == nn.Linear:
+                print(m)
+                torch.quantization.fuse_modules(m, ['Linear'], inplace=True)

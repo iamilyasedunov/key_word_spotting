@@ -1,7 +1,7 @@
 from dataset_utils import DatasetDownloader, TrainDataset, SpeechCommandDataset
 from sklearn.model_selection import train_test_split
 from preprocessing.log_mel_spec import LogMelspec
-from model.model_fixed import *
+from model.model import *
 from train_utils.utils import *
 import warnings
 import torch.quantization
@@ -70,28 +70,9 @@ def main(config):
         checkpoint = torch.load(config.distillation_soft_labels.resume)
         state_dict = checkpoint["state_dict"]
         model.load_state_dict(state_dict, strict=False)
-
+        print(f"Distilled model loaded: {config.distillation_soft_labels.resume}")
         get_model_info(model, loader_for_check_model, melspec_val, device)
         trainer.validation(model, val_loader, melspec_val, config.device, config_writer)
-
-    if config['pruning']:
-        if config['pruning']['un_structured']:
-            model_unstruct_pruned = prune_model_l1_unstructured(model, config['pruning']['un_structured'])
-            trainer.validation(model_unstruct_pruned, val_loader, melspec_val, config.device, config_writer)
-            get_model_info(model_unstruct_pruned, loader_for_check_model, melspec_val, device)
-
-        if config['pruning']['structured']:
-            model_struct_pruned = prune_model_l1_structured(model, config['pruning']['structured'])
-            trainer.validation(model_struct_pruned, val_loader, melspec_val, config.device, config_writer)
-            get_model_info(model_struct_pruned, loader_for_check_model, melspec_val, device)
-
-    if config['resume_jit']:
-        model_jit = load_torchscript_model(config['resume_jit'], config.device)
-        print('*' * 30, "[STATIC QUANT]", '*' * 30)
-        print('Eval jit model')
-        trainer.validation(model_jit, val_loader, melspec_val, config.device, config_writer)
-
-        get_model_info(model_jit, loader_for_check_model, melspec_val, device)
 
     if config["quantize_dynamic"]:
         # model = model.to('cpu')
@@ -109,18 +90,6 @@ def main(config):
 
                 # save_torchscript_model(quantized_model, "saved/models/kws_sheila/1110_220958/",
                 #                       "linear_gru_int8_dynamic_quant.pt")
-    if config['quantize_static']:
-        print('*' * 30, "[STATIC QUANT]", '*' * 30)
-        backend = "fbgemm"
-        model.qconfig = torch.quantization.get_default_qconfig(backend)
-        model.gru.qconfig = None
-        model.attention.qconfig = None
-        # model.attn_layer.softmax.qconfig = None
-        torch.backends.quantized.engine = backend
-        model_static_quantized = torch.quantization.prepare(model, inplace=True)
-        model_static_quantized = torch.quantization.convert(model_static_quantized, inplace=True)
-        trainer.validation(model_static_quantized, val_loader, melspec_val, config.device, config_writer)
-        get_model_info(model_static_quantized, loader_for_check_model, melspec_val, device)
 
 
 if __name__ == "__main__":
@@ -149,12 +118,11 @@ if __name__ == "__main__":
         'num_classes': 2,  # number of classes (2 for "no word" or "sheila is in audio")
         'sample_rate': 16000,
         'device': device.__str__(),
-        'resume': "saved/models/kws_sheila_crnn_unidirect_teacher/1118_190401/model_acc_2e-05_epoch_32.pth",
-        # "saved/models/kws_sheila/1110_220958/model_acc_0.97_epoch_90.pth",
-        'resume_jit': False,  # "saved/models/kws_sheila/1110_220958/linear_gru_int8_dynamic_quant.pt",
+        'resume': "other/model_acc_2e-05_epoch_42.pth",
+        'resume_jit': False,
         'quantize_dynamic': [{"layers": {torch.nn.Linear, nn.GRU}, "dtype": [torch.qint8]}],
-                             #[{"layers": {torch.nn.Linear}, "dtype": [torch.float16, torch.qint8, ]},
-                             #{"layers": {torch.nn.Linear, nn.GRU}, "dtype": [torch.float16, torch.qint8]}],
+                             # [{"layers": {torch.nn.Linear}, "dtype": [torch.float16, torch.qint8, ]},
+                             # {"layers": {torch.nn.Linear, nn.GRU}, "dtype": [torch.float16, torch.qint8]}],
         'quantize_static': True,
         'pruning': {"un_structured": False,  # [{"layer": nn.Conv1d, "prob": 0.5},
                     # {"layer": nn.Linear, "prob": 0.5}],
@@ -166,17 +134,16 @@ if __name__ == "__main__":
         'distillation_soft_labels': {
             'mimic_logits': False,
             'soft_labels': False,
-            'resume': "saved/models/kws_sheila_crnn_unidirect_teacher/1118_190401/model_acc_2e-05_epoch_32.pth",
-            # "saved/models/kws_sheila_crnn_biderect_teacher/1117_001227/model_acc_0.00067_epoch_99.pth",
+            'resume': "other/model_acc_3e-05_epoch_290.pth",
             "student_config": {
                 'T': 15.0,
                 'lambda_': 0.95,
-                'cnn_out_channels': 8,
+                'cnn_out_channels': 4,
                 'kernel_size': (5, 20),
                 'stride': (2, 8),
                 'n_mels': 40,
-                'hidden_size': 64,
-                'gru_num_layers': 2,
+                'hidden_size': 16,
+                'gru_num_layers': 1,
                 'bidirectional': False,
                 'num_classes': 2,
                 'dropout': 0.0,

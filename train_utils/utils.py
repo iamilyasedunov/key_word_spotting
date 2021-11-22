@@ -24,6 +24,38 @@ class Trainer():
     def get_mean_val_au_fa_fr(self):
         return self.last_val_metric
 
+    def log_train(self, logits, loss, labels):
+        probs = F.softmax(logits, dim=-1)
+        argmax_probs = torch.argmax(probs, dim=-1)
+        FA, FR = count_FA_FR(argmax_probs, labels)
+        acc = torch.sum(argmax_probs == labels).item() / torch.numel(argmax_probs)
+
+        self.train_metrics["train_losses"].append(loss)
+        self.train_metrics["train_accs"].append(acc)
+        self.train_metrics["train_FAs"].append(FA)
+        self.train_metrics["train_FRs"].append(FR)
+
+        if self.step % self.config["log_step"] == 0:
+            if self.writer is not None:
+                self.writer.set_step(self.step)
+                self.writer.add_scalars("train", {'loss': np.mean(self.train_metrics["train_losses"]),
+                                                  'acc': np.mean(self.train_metrics["train_accs"]),
+                                                  'FA': np.mean(self.train_metrics["train_FAs"]),
+                                                  'FR': np.mean(self.train_metrics["train_FRs"])})
+            self.train_metrics = {
+                "train_losses": [], "train_accs": [], "train_FAs": [], "train_FRs": [],
+            }
+
+    def log_after_train_epoch(self, config_writer):
+        if self.writer is not None:
+            self.writer.add_scalar(f"epoch", config_writer["epoch"])
+        else:
+            print({'loss': np.mean(self.train_metrics["train_losses"]),
+                   'acc': np.mean(self.train_metrics["train_accs"]),
+                   'FA': np.mean(self.train_metrics["train_FAs"]),
+                   'FR': np.mean(self.train_metrics["train_FRs"])})
+        print(f"Epoch end, acc {np.mean(self.train_metrics['train_accs'])}")
+
     def train_kd_mimic_logits(self, teacher, student, opt, loader, log_melspec, device, config_writer):
         teacher.eval()
         student.train()
@@ -38,11 +70,6 @@ class Trainer():
             with torch.no_grad():
                 logits_teach = teacher(batch)
 
-            # logits_teach = logits_teach.to(torch.long)
-
-            # print(logits_st)
-            # print(logits_teach)
-            # print(labels)
             loss = F.mse_loss(logits_st, logits_teach)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(student.parameters(), 5)
@@ -50,34 +77,9 @@ class Trainer():
             opt.step()
 
             # logging
-            probs = F.softmax(logits_st, dim=-1)
-            argmax_probs = torch.argmax(probs, dim=-1)
-            FA, FR = count_FA_FR(argmax_probs, labels)
-            acc = torch.sum(argmax_probs == labels).item() / torch.numel(argmax_probs)
+            self.log_train(logits_st, loss.item(), labels)
 
-            self.train_metrics["train_losses"].append(loss.item())
-            self.train_metrics["train_accs"].append(acc)
-            self.train_metrics["train_FAs"].append(FA)
-            self.train_metrics["train_FRs"].append(FR)
-
-            if self.step % self.config["log_step"] == 0:
-                if self.writer is not None:
-                    self.writer.set_step(self.step)
-                    self.writer.add_scalars("train", {'loss': np.mean(self.train_metrics["train_losses"]),
-                                                      'acc': np.mean(self.train_metrics["train_accs"]),
-                                                      'FA': np.mean(self.train_metrics["train_FAs"]),
-                                                      'FR': np.mean(self.train_metrics["train_FRs"])})
-                self.train_metrics = {
-                    "train_losses": [], "train_accs": [], "train_FAs": [], "train_FRs": [],
-                }
-        if self.writer is not None:
-            self.writer.add_scalar(f"epoch", config_writer["epoch"])
-        else:
-            print({'loss': np.mean(self.train_metrics["train_losses"]),
-                   'acc': np.mean(self.train_metrics["train_accs"]),
-                   'FA': np.mean(self.train_metrics["train_FAs"]),
-                   'FR': np.mean(self.train_metrics["train_FRs"])})
-        print(f"Epoch acc: {acc}")
+        self.log_after_train_epoch(config_writer)
 
     def train_kd_soft_labels(self, teacher, student, opt, loader, log_melspec, device, config_writer):
         def softXEnt(input_, target_):
@@ -98,8 +100,6 @@ class Trainer():
             hard_predictions = F.softmax(logits_st, dim=-1)
             soft_predictions = F.softmax(logits_st / T, dim=-1)
             soft_labels = F.softmax(logits_teach / T, dim=-1)
-            # print(f"soft_labels     : {soft_labels.shape}")
-            # print(f"soft_predictions: {soft_predictions.shape}")
             distillation_loss = softXEnt(soft_predictions, soft_labels) / (T ** 2)
             student_loss = F.cross_entropy(hard_predictions, labels)
 
@@ -107,40 +107,14 @@ class Trainer():
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(student.parameters(), 5)
-            # print(f"student_loss: {student_loss.item()}, distillation_loss: {distillation_loss.item()}")
             opt.step()
 
             opt.zero_grad()
 
             # logging
-            argmax_probs = torch.argmax(hard_predictions, dim=-1)
-            FA, FR = count_FA_FR(argmax_probs, labels)
-            acc = torch.sum(argmax_probs == labels).item() / torch.numel(argmax_probs)
+            self.log_train(logits_st, loss.item(), labels)
 
-            self.train_metrics["train_losses"].append(loss.item())
-            self.train_metrics["train_accs"].append(acc)
-            self.train_metrics["train_FAs"].append(FA)
-            self.train_metrics["train_FRs"].append(FR)
-
-            if self.step % self.config["log_step"] == 0:
-                if self.writer is not None:
-                    self.writer.set_step(self.step)
-                    self.writer.add_scalars("train", {'loss': np.mean(self.train_metrics["train_losses"]),
-                                                      'acc': np.mean(self.train_metrics["train_accs"]),
-                                                      'FA': np.mean(self.train_metrics["train_FAs"]),
-                                                      'FR': np.mean(self.train_metrics["train_FRs"])})
-                self.train_metrics = {
-                    "train_losses": [], "train_accs": [], "train_FAs": [], "train_FRs": [],
-                }
-        if self.writer is not None:
-            self.writer.add_scalar(f"epoch", config_writer["epoch"])
-        else:
-            print({'loss': np.mean(self.train_metrics["train_losses"]),
-                   'acc': np.mean(self.train_metrics["train_accs"]),
-                   'FA': np.mean(self.train_metrics["train_FAs"]),
-                   'FR': np.mean(self.train_metrics["train_FRs"])})
-
-        print(f"Epoch acc: {acc}")
+        self.log_after_train_epoch(config_writer)
 
     def train_epoch(self, model, opt, loader, log_melspec, device, config_writer):
         model.train()
@@ -153,39 +127,17 @@ class Trainer():
             batch = log_melspec(batch)
 
             opt.zero_grad()
-            # define frist hidden with 0
-            # run model # with autocast():
             logits = model(batch)
-            probs = F.softmax(logits, dim=-1)  # we need probabilities so we use softmax & CE separately
             loss = F.cross_entropy(logits, labels)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
-            # print(f"loss: {loss.item()}")
             opt.step()
 
             # logging
-            argmax_probs = torch.argmax(probs, dim=-1)
-            FA, FR = count_FA_FR(argmax_probs, labels)
-            acc = torch.sum(argmax_probs == labels).item() / torch.numel(argmax_probs)
+            self.log_train(logits, loss.item(), labels)
 
-            self.train_metrics["train_losses"].append(loss.item())
-            self.train_metrics["train_accs"].append(acc)
-            self.train_metrics["train_FAs"].append(FA)
-            self.train_metrics["train_FRs"].append(FR)
-
-            if self.step % self.config["log_step"] == 0:
-                self.writer.set_step(self.step)
-                self.writer.add_scalars("train", {'loss': np.mean(self.train_metrics["train_losses"]),
-                                                  'acc': np.mean(self.train_metrics["train_accs"]),
-                                                  'FA': np.mean(self.train_metrics["train_FAs"]),
-                                                  'FR': np.mean(self.train_metrics["train_FRs"])})
-                self.train_metrics = {
-                    "train_losses": [], "train_accs": [], "train_FAs": [], "train_FRs": [],
-                }
-        self.writer.add_scalar(f"epoch", config_writer["epoch"])
-
-        print(f"Epoch acc: {acc}")
+        self.log_after_train_epoch(config_writer)
 
     @torch.no_grad()
     def validation(self, model, loader, log_melspec, device, config_writer):
@@ -198,10 +150,6 @@ class Trainer():
             batch, labels = batch.to(device), labels.to(device)
             batch = log_melspec(batch)
 
-            # define frist hidden with 0
-            # hidden = torch.zeros(gru_nl * gru_nd, batch.size(0), hidden_size).to(
-            #    device)  # (num_layers * num_dirs, BS, )
-            # run model   # with autocast():
             start = datetime.now()
 
             output = model(batch)
@@ -229,9 +177,7 @@ class Trainer():
             self.val_metrics["val_time_inference"].append(time_infer)
         # area under FA/FR curve for whole loader
         au_fa_fr = get_au_fa_fr(torch.cat(all_probs, dim=0).cpu(), all_labels)
-        # wandb.log({'mean_val_loss':np.mean(val_losses), 'mean_val_acc':np.mean(accs),
-        #            'mean_val_FA':np.mean(FAs), 'mean_val_FR':np.mean(FRs),
-        #            'au_fa_fr':au_fa_fr})
+
         print({'mean_val_loss': round(np.mean(self.val_metrics["val_losses"]), 5),
                'mean_val_acc': round(np.mean(self.val_metrics["val_accs"]), 5),
                'mean_val_FA': round(np.mean(self.val_metrics["val_FAs"]), 5),

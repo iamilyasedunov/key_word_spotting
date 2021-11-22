@@ -1,10 +1,9 @@
-from dataset_utils import DatasetDownloader, TrainDataset, SpeechCommandDataset
-from sklearn.model_selection import train_test_split
+from dataset_utils import SpeechCommandDataset
+from model.model import CRNN
 from augmentations.augs_creation import AugsCreation
 from preprocessing.log_mel_spec import LogMelspec
 from train_utils.utils import *
 from logger import *
-import copy
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -13,10 +12,6 @@ set_seed(21)
 
 
 def main(config):
-    if config.qat:
-        from model.qat_model import CRNN
-    else:
-        from model.model_fixed import CRNN
 
     writer = get_writer(config)
 
@@ -39,11 +34,9 @@ def main(config):
     student_model = None
     # sampler for oversampling
     train_sampler = get_sampler(train_set.csv['label'].values)
-    #val_sampler = get_sampler(val_set.csv['label'].values)
 
     # Dataloaders
     # Here we are obliged to use shuffle=False because of our sampler with randomness inside.
-
     train_loader = DataLoader(train_set, batch_size=config.batch_size,
                               shuffle=False, collate_fn=Collator(),
                               sampler=train_sampler,
@@ -71,30 +64,6 @@ def main(config):
         print(f"Model loaded from checkpoint: {config.resume}")
     print(model)
     get_model_info(model, val_check, melspec_val, config.device)
-
-    if config.qat:
-        backend = "fbgemm"
-        torch.backends.quantized.engine = backend
-        qat_model = copy.deepcopy(model)
-        # qat_model.fuse_model()
-        qat_model.train()
-        qat_model.qconfig = torch.quantization.get_default_qat_qconfig(backend)
-        model.gru.qconfig = None
-        model.attention.qconfig = None
-        qat_model_fused = torch.quantization.fuse_modules(qat_model.conv, [['0', '1']])
-        qat_model_fused = torch.quantization.fuse_modules(qat_model_fused.attention.energy, [['0', '2']])
-        qat_model_fused = torch.quantization.fuse_modules(qat_model_fused, [['classifier']])
-
-        qat_model_prepared = torch.quantization.prepare_qat(qat_model_fused, inplace=True)
-        model = copy.deepcopy(qat_model_prepared)
-
-    if config.structured_pruning_dynamic_quant:
-        # layer_type, proportion = nn.Conv2d, 0.5
-        # prune_model(model=model, pruning_fn="random_structured", amount=0.8, dim=0, l_norm=1)
-        pruned_model = copy.deepcopy(model)
-        pruned_model.gru = prune.ln_structured(model.gru, 'weight_ih_l0', 0.5, n=1, dim=1)
-        pruned_model.gru = prune.remove(pruned_model.gru, 'weight_ih_l0')
-        get_model_info(pruned_model, val_check, melspec_val, config.device)
 
     if config.distillation_soft_labels.mimic_logits or config.distillation_soft_labels.soft_labels:
         student_model = CRNN(config.distillation_soft_labels.student_config)
@@ -170,7 +139,7 @@ if __name__ == "__main__":
         'weight_decay': 1e-5,
         'num_epochs': 300,
         'bidirectional': False,
-        'resume': "saved/models/kws_sheila_crnn_unidirect_teacher/1118_190401/model_acc_2e-05_epoch_42.pth",
+        'resume': "other/model_acc_2e-05_epoch_42.pth",
         'cnn_out_channels': 8,
         'n_mels': 40,  # number of mels for melspectrogram
         'kernel_size': (5, 20),  # size of kernel for convolution layer in CRNN
@@ -182,12 +151,11 @@ if __name__ == "__main__":
         'dropout': 0.1,
         'sample_rate': 16000,
         'device': device.__str__(),
-        'qat': False,
         'structured_pruning_dynamic_quant': False,
         'distillation_soft_labels': {
             'mimic_logits': True,
             'soft_labels': False,
-            'resume': False, #"saved/models/kws_sheila_crnn_unidirect_teacher/1118_232130/model_acc_5e-05_epoch_282.pth",
+            'resume': False,
             "student_config": {
                 'T': 15.0,
                 'lambda_': 0.95,
