@@ -1,4 +1,4 @@
-from dataset_utils import SpeechCommandDataset
+from dataset_utils import SpeechCommandDataset, DatasetDownloader
 from model.model import CRNN
 from augmentations.augs_creation import AugsCreation
 from preprocessing.log_mel_spec import LogMelspec
@@ -14,7 +14,7 @@ set_seed(21)
 def main(config):
 
     writer = get_writer(config)
-
+    _ = DatasetDownloader(key_word)
     dataset = SpeechCommandDataset(
         path2dir='speech_commands', keywords=config.keyword
     )
