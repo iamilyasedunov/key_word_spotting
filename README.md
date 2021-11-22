@@ -1,9 +1,24 @@
 # Homework 2 (KWS)
 
-### Progress
+### Installation guide:
 
-    1) Train main model: [report](https://wandb.ai/iamilyasedunov/train/reports/Key-Word-Spotting--VmlldzoxMjEyMTE0)
+    1) git clone https://github.com/iamilyasedunov/key_word_spotting.git
+    2) cd key_word_spotting
+    3) bash docker_start.sh
+    4) docker attach ISedunov-kws_report
+    5) cd /home/key_word_spotting/key_word_spotting
+    6) python train.py
+    7) python test.py
 
+-------
+
+### Result:
+
+    **au fa fr**: 3e-05
+
+    **MACs reduction times**: 7,086758545
+
+    **Model size reduction (times):** 12,73771711
 _______
 
 ### Task
