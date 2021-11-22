@@ -13,6 +13,8 @@ set_seed(21)
 
 def main(config):
     writer = None
+    _ = DatasetDownloader(key_word)
+
     dataset = SpeechCommandDataset(
         path2dir='speech_commands', keywords=config.keyword
     )
